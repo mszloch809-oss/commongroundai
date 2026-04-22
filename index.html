@@ -1,0 +1,18 @@
+export const json = (body, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store"
+    }
+  });
+
+export const badRequest = (message) => json({ ok: false, error: message }, 400);
+
+export const nowIso = () => new Date().toISOString();
+
+export const makeId = (prefix = "id") => `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+
+export const normalizePhone = (value = "") => value.replace(/[^\d+]/g, "");
+
+export const lower = (value = "") => value.trim().toLowerCase();
