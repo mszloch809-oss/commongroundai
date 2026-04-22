@@ -1,205 +1,23 @@
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
 
-import { classifyTenantIssue, interpretVendorReply } from './ai.js';
-import { sendSms } from './twilio.js';
-import { makeId, nowIso, normalizePhone } from './utils.js';
+[[redirects]]
+  from = "/api/state"
+  to = "/.netlify/functions/state"
+  status = 200
 
-export function addTimeline(state, event) {
-  state.timeline.unshift({ id: makeId('evt'), at: nowIso(), ...event });
-}
+[[redirects]]
+  from = "/api/report-issue"
+  to = "/.netlify/functions/report-issue"
+  status = 200
 
-export function getTenant(state, propertyId, unit) {
-  return state.tenants.find((t) => t.propertyId === propertyId && t.unit === unit);
-}
+[[redirects]]
+  from = "/api/vendor-sms"
+  to = "/.netlify/functions/vendor-sms"
+  status = 200
 
-export function pushTenantMessage(state, propertyId, unit, text, meta = {}) {
-  const tenant = getTenant(state, propertyId, unit);
-  if (!tenant) return;
-  tenant.inbox.push({ id: makeId('msg'), from: 'system', text, at: nowIso(), ...meta });
-}
-
-export function selectVendor(state, category, requestedName = null) {
-  if (requestedName) {
-    return state.vendors.find((v) => v.name === requestedName) || null;
-  }
-  const exactPreferred = state.vendors.find((v) => v.trade === category && v.preferred);
-  if (exactPreferred) return exactPreferred;
-  const exact = state.vendors.find((v) => v.trade === category);
-  if (exact) return exact;
-  const generalPreferred = state.vendors.find((v) => v.trade === 'general' && v.preferred);
-  if (generalPreferred) return generalPreferred;
-  return state.vendors.find((v) => v.trade === 'general') || null;
-}
-
-export async function dispatchVendorForWorkOrder(state, workOrder, vendor, notes = '') {
-  workOrder.assigneeVendorId = vendor?.id || null;
-  workOrder.assigneeVendorName = vendor?.name || null;
-  workOrder.status = vendor ? 'dispatched' : 'open';
-  workOrder.updatedAt = nowIso();
-  if (notes) workOrder.internalNotes = notes;
-
-  let smsResult = { ok: false, skipped: true, reason: 'No vendor matched.' };
-
-  if (vendor) {
-    const smsBody = [
-      `CommonGround work order ${workOrder.id}`,
-      `Property: ${workOrder.propertyId}`,
-      `Unit: ${workOrder.unit}`,
-      `Issue: ${workOrder.title}`,
-      `Category: ${workOrder.category}`,
-      `Priority: ${workOrder.priority}`,
-      workOrder.description ? `Details: ${workOrder.description}` : null,
-      '',
-      'Reply YES to accept, ETA with an arrival update, or DONE when completed.'
-    ].filter(Boolean).join('\n');
-
-    smsResult = await sendSms({ to: vendor.phone, body: smsBody });
-
-    workOrder.events.unshift({
-      id: makeId('woevt'),
-      at: nowIso(),
-      type: 'sms_sent',
-      message: smsResult.ok
-        ? `SMS sent to ${vendor.name}.`
-        : `SMS not sent. ${smsResult.reason || 'Twilio not configured.'}`
-    });
-
-    addTimeline(state, {
-      kind: 'vendor_dispatch',
-      workOrderId: workOrder.id,
-      text: smsResult.ok
-        ? `Vendor ${vendor.name} dispatched for work order ${workOrder.id}.`
-        : `Dispatch prepared for ${vendor.name}, but SMS was not sent.`
-    });
-
-    pushTenantMessage(
-      state,
-      workOrder.propertyId,
-      workOrder.unit,
-      smsResult.ok
-        ? `${vendor.name} has been contacted for your maintenance request. We'll keep you updated here.`
-        : `Your maintenance request was logged. A manager still needs to dispatch the vendor.`,
-      { linkedWorkOrderId: workOrder.id }
-    );
-  } else {
-    pushTenantMessage(state, workOrder.propertyId, workOrder.unit, 'Your maintenance request was logged. A manager will assign a vendor shortly.', { linkedWorkOrderId: workOrder.id });
-  }
-
-  return smsResult;
-}
-
-export async function createWorkOrderFromTenant(state, { propertyId, unit, text }) {
-  const classification = await classifyTenantIssue(text);
-  const vendor = selectVendor(state, classification.category);
-  const workOrder = {
-    id: makeId('wo'),
-    propertyId,
-    unit,
-    title: classification.title,
-    category: classification.category,
-    priority: classification.priority,
-    description: classification.description,
-    status: 'open',
-    assigneeVendorId: null,
-    assigneeVendorName: null,
-    internalNotes: `Auto-dispatched via tenant AI report for unit ${unit}.`,
-    createdAt: nowIso(),
-    updatedAt: nowIso(),
-    events: []
-  };
-
-  state.workOrders.unshift(workOrder);
-
-  workOrder.events.unshift({
-    id: makeId('woevt'),
-    at: nowIso(),
-    type: 'created',
-    message: `AI classified issue as ${classification.category} / ${classification.priority}.`
-  });
-
-  addTimeline(state, {
-    kind: 'work_order_created',
-    workOrderId: workOrder.id,
-    text: `Work order ${workOrder.id} created for Unit ${unit}.`
-  });
-
-  pushTenantMessage(
-    state,
-    propertyId,
-    unit,
-    `We received your report: "${classification.title}". The right vendor is being contacted now.`,
-    { linkedWorkOrderId: workOrder.id }
-  );
-
-  const smsResult = await dispatchVendorForWorkOrder(state, workOrder, vendor, workOrder.internalNotes);
-  return { workOrder, classification, vendor, smsResult };
-}
-
-export async function dispatchExistingWorkOrder(state, { workOrderId, vendorName, notes = '' }) {
-  const workOrder = state.workOrders.find((wo) => wo.id === workOrderId);
-  if (!workOrder) throw new Error('Work order not found.');
-  const vendor = selectVendor(state, workOrder.category, vendorName);
-  if (!vendor) throw new Error('Vendor not found.');
-
-  workOrder.events.unshift({
-    id: makeId('woevt'),
-    at: nowIso(),
-    type: 'manual_dispatch',
-    message: `Manager dispatched ${vendor.name}.`
-  });
-
-  const smsResult = await dispatchVendorForWorkOrder(state, workOrder, vendor, notes);
-  return { workOrder, vendor, smsResult };
-}
-
-export async function processVendorReply(state, { from, text }) {
-  const normalizedFrom = normalizePhone(from);
-  const vendor = state.vendors.find((v) => normalizePhone(v.phone) === normalizedFrom);
-  if (!vendor) {
-    return { ok: false, error: 'Vendor phone not recognized.' };
-  }
-
-  const workOrder = state.workOrders.find(
-    (wo) => wo.assigneeVendorId === vendor.id && ['dispatched', 'in_progress', 'open'].includes(wo.status)
-  );
-
-  if (!workOrder) {
-    return { ok: false, error: 'No active work order found for vendor.' };
-  }
-
-  const interpretation = await interpretVendorReply(text);
-  workOrder.updatedAt = nowIso();
-
-  let tenantText = `${vendor.name} sent an update: ${interpretation.summary}`;
-
-  if (interpretation.action === 'accepted') {
-    workOrder.status = 'in_progress';
-    tenantText = `${vendor.name} accepted your maintenance request and will follow up with timing.`;
-  } else if (interpretation.action === 'completed') {
-    workOrder.status = 'closed';
-    tenantText = `${vendor.name} marked your maintenance request complete. Your work order has been closed.`;
-  } else if (interpretation.action === 'declined') {
-    workOrder.status = 'open';
-    workOrder.assigneeVendorId = null;
-    workOrder.assigneeVendorName = null;
-    tenantText = `${vendor.name} could not take the job. Your manager has been notified and the request is back open.`;
-  }
-
-  workOrder.events.unshift({
-    id: makeId('woevt'),
-    at: nowIso(),
-    type: `vendor_${interpretation.action}`,
-    message: `${vendor.name}: ${interpretation.summary}`
-  });
-
-  addTimeline(state, {
-    kind: 'vendor_reply',
-    workOrderId: workOrder.id,
-    text: `${vendor.name} replied ${interpretation.action} on work order ${workOrder.id}.`
-  });
-
-  pushTenantMessage(state, workOrder.propertyId, workOrder.unit, tenantText, {
-    linkedWorkOrderId: workOrder.id
-  });
-
-  return { ok: true, vendor, workOrder, interpretation };
-}
+[[redirects]]
+  from = "/api/manager-agent"
+  to = "/.netlify/functions/manager-agent"
+  status = 200 
